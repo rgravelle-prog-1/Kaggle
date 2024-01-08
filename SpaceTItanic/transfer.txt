@@ -1,0 +1,94 @@
+library(tidyverse)
+library(randomForest)
+library(xgboost)
+library(caret)
+
+set.seed(42)  # Set seed for reproducibility
+sample_indices <- sample(1:nrow(all_data), size = 0.8 * nrow(all_data))  # Adjust the fraction as needed
+sampled_data <- all_data[sample_indices, ]
+
+
+# Assuming 'df.train' is your training dataset
+df.train <- drop_na(df.train)
+
+# Set the number of folds for cross-validation
+num_folds <- 5
+
+# Create a data frame for cross-validation with 'Transported' as a factor
+df.train$Transported <- as.factor(df.train$Transported)
+
+# Set up k-fold cross-validation
+folds <- createFolds(df.train$Transported, k = num_folds, list = TRUE, returnTrain = FALSE)
+
+# Initialize an empty list to store base model predictions
+base_model_predictions <- list()
+
+# Perform k-fold cross-validation for Random Forest
+for (i in 1:num_folds) {
+  # Create training and test sets for the current fold
+  train_indices <- unlist(folds[-i])
+  test_indices <- unlist(folds[i])
+  
+  train_data <- df.train[train_indices, ]
+  test_data <- df.train[test_indices, ]
+  
+  # Train the Random Forest model
+  rf_model <- randomForest(Transported ~ HomePlanet + CryoSleep + Destination + Age +
+                              VIP + RoomService + FoodCourt + ShoppingMall + Spa + VRDeck + Deck,
+                            data = train_data,
+                            importance = TRUE,
+                            ntree = 2000)
+  
+  # Make predictions on the test set and store them
+  predictions_rf <- predict(rf_model, test_data)
+  base_model_predictions[[paste0("rf_", i)]] <- data.frame(PassengerId = test_data$PassengerId, Transported = predictions_rf)
+}
+
+# Perform k-fold cross-validation for XGBoost
+for (i in 1:num_folds) {
+  # Create training and test sets for the current fold
+  train_indices <- unlist(folds[-i])
+  test_indices <- unlist(folds[i])
+  
+  train_data <- df.train[train_indices, ]
+  test_data <- df.train[test_indices, ]
+  
+  # Create a unified data matrix for XGBoost
+  all_data <- rbind(train_data, test_data)
+  dmatrix <- xgb.DMatrix(data = model.matrix(Transported ~ ., data = all_data)[, -1],
+                         label = as.numeric(all_data$Transported == "True"))
+  
+  # Train the XGBoost model using cross-validation
+  xgb_params <- list(objective = "binary:logistic", eval_metric = "logloss")
+  cv_results <- xgb.cv(data = dmatrix, params = xgb_params, nrounds = 200, nfold = 5, showsd = TRUE)
+  
+  # Choose the best number of rounds based on cross-validation
+  best_nrounds <- which.min(cv_results$test_logloss_mean)
+  
+  # Train the final XGBoost model
+
+  xgb_params <- list(objective = "binary:logistic", eval_metric = "logloss", max_depth = 5, subsample = 0.8)
+  xgb_model <- xgboost(data = dmatrix, params = xgb_params, nrounds = best_nrounds)
+  
+  # Make predictions on the test set and store them
+  dtest <- xgb.DMatrix(data = model.matrix(Transported ~ ., data = test_data)[, -1])
+  predictions_xgb <- predict(xgb_model, newdata = dtest)
+  base_model_predictions[[paste0("xgb_", i)]] <- data.frame(PassengerId = test_data$PassengerId, Transported = predictions_xgb)
+}
+
+# Combine base model predictions into a single data frame
+stacked_data <- bind_rows(base_model_predictions)
+
+# Fit a logistic regression meta-model
+meta_model <- glm(Transported ~ ., data = stacked_data, family = "binomial")
+
+# Make predictions on the test set using the meta-model
+test_data <- df.train  # Replace with your test set
+meta_predictions <- predict(meta_model, newdata = test_data, type = "response")
+
+# Create a submission data frame
+submit <- data.frame(PassengerId = test_data$PassengerId, Transported = ifelse(meta_predictions > 0.5, "True", "False"))
+
+# Write the submission file
+write.csv(submit, file = "ensemble_submission.csv", row.names = FALSE)
+
